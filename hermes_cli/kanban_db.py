@@ -8261,6 +8261,39 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _worker_kill_fn(signal_fn=None):
+    """Return a kill callable that targets the worker's whole process group.
+
+    Workers are spawned with ``start_new_session=True`` (see
+    ``_default_spawn``), so the worker PID is also its process-group ID
+    (PGID == PID). Killing the group takes down the agent kernel's spawned
+    children (bash tool subprocesses etc.) instead of leaving them as
+    orphans that keep writing in the task worktree (t_a2b73dfd).
+
+    Falls back to a plain PID kill when process groups are unavailable
+    (Windows) or the group lookup fails. ``signal_fn`` (test hook) is
+    returned unchanged and receives the group kill as ``f(pgid, sig)``
+    with ``pgid == pid``.
+    """
+    if signal_fn is not None:
+        return signal_fn
+    if not hasattr(os, "killpg"):
+        return getattr(os, "kill", None)
+
+    def _kill_group(pgid: int, sig: int) -> None:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            # Process group is gone. The worker was spawned as its own group
+            # leader, so the leader is gone too — but retry via os.kill so a
+            # worker that somehow ended up outside its original group (or a
+            # platform where PGID != PID) still gets signalled. Raises
+            # ProcessLookupError itself when the worker is truly gone.
+            os.kill(pgid, sig)
+
+    return _kill_group
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -8285,9 +8318,7 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
+    kill = _worker_kill_fn(signal_fn)
     if kill is None:
         return info
 
@@ -8480,9 +8511,7 @@ def enforce_max_runtime(
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
         killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
-        )
+        kill = _worker_kill_fn(signal_fn)
         if kill is not None:
             try:
                 kill(pid, signal.SIGTERM)
