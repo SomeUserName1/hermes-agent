@@ -7035,6 +7035,17 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id, statuses=("blocked", "scheduled"), now=now,
             note="invariant recovery on unblock",
         )
+        # Prime pipeline (Task 4, spec 5.1): unblocking an architect task
+        # whose plan awaits approval IS the plan approval. The shim's
+        # architect phase 1 wrote plans.status='awaiting-approval' and
+        # blocked with 'awaiting-plan-approval'; the unblock flips the row
+        # to 'approved' so the next run takes the architect phase-2 path.
+        # Mirrors shim.flip_plan_approved() (tests/test_architect.py).
+        conn.execute(
+            "UPDATE plans SET status = 'approved', approved_at = ? "
+            "WHERE task_id = ? AND status = 'awaiting-approval'",
+            (now, task_id),
+        )
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
         new_status = (
