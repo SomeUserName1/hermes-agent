@@ -1522,6 +1522,18 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+
+CREATE TABLE IF NOT EXISTS plans (
+    id                  TEXT PRIMARY KEY,
+    task_id             TEXT NOT NULL,
+    body_md             TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'draft',
+    created_by          TEXT,
+    created_at          INTEGER,
+    approved_by         TEXT,
+    approved_at         INTEGER,
+    estimate_hours_total REAL
+);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2689,6 +2701,43 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    # Pipeline columns (prime-pipeline §3.1). NULL role = legacy behaviour.
+    if "role" not in cols:
+        _add_column_if_missing(conn, "tasks", "role", "role TEXT")
+    if "plan_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "plan_id", "plan_id TEXT")
+    if "forgejo_issue" not in cols:
+        _add_column_if_missing(conn, "tasks", "forgejo_issue", "forgejo_issue TEXT")
+    if "forgejo_kind" not in cols:
+        _add_column_if_missing(conn, "tasks", "forgejo_kind", "forgejo_kind TEXT")
+
+    # Run-evidence columns for the pipeline (review + JEI decision payload).
+    rcols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+    if "review_text" not in rcols:
+        _add_column_if_missing(conn, "task_runs", "review_text", "review_text TEXT")
+    if "jev_decision" not in rcols:
+        _add_column_if_missing(conn, "task_runs", "jev_decision", "jev_decision TEXT")
+    if "jev_payload" not in rcols:
+        _add_column_if_missing(conn, "task_runs", "jev_payload", "jev_payload TEXT")
+
+    # Plans table (pipeline spec bodies). Defensive here so legacy DBs get
+    # it even if SCHEMA_SQL creation was skipped for any reason.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plans (
+            id                  TEXT PRIMARY KEY,
+            task_id             TEXT NOT NULL,
+            body_md             TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'draft',
+            created_by          TEXT,
+            created_at          INTEGER,
+            approved_by         TEXT,
+            approved_at         INTEGER,
+            estimate_hours_total REAL
+        )
+        """
+    )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
