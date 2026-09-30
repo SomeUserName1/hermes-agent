@@ -6908,7 +6908,7 @@ def promote_task(
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
+            "WHERE l.child_id = ? AND l.kind = 'dep'",
             (task_id,),
         ).fetchall()
         unsatisfied = [

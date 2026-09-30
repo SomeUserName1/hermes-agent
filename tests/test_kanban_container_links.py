@@ -201,3 +201,29 @@ def test_fresh_db_has_kind_column(tmp_path):
         assert "kind" in cols
     finally:
         conn.close()
+
+
+def test_promote_ignores_container_parent(kb_conn):
+    """promote_task fast-follow: only kind='dep' parents gate promotion."""
+    from hermes_cli import kanban_db as kb
+
+    parent = _mk(kb_conn, "container parent", initial_status="todo")
+    child = _mk(kb_conn, "child")
+    kb.link_tasks(kb_conn, parent, child, kind="container")
+    kb_conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (parent,))
+    kb_conn.commit()
+    ok, err = kb.promote_task(kb_conn, child, actor="test")
+    assert ok, f"container parent must not block promotion: {err}"
+
+
+def test_promote_still_gated_by_dep_parent(kb_conn):
+    from hermes_cli import kanban_db as kb
+
+    parent = _mk(kb_conn, "dep parent", initial_status="todo")
+    child = _mk(kb_conn, "child")
+    kb.link_tasks(kb_conn, parent, child)  # kind='dep'
+    kb_conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (parent,))
+    kb_conn.commit()
+    ok, err = kb.promote_task(kb_conn, child, actor="test")
+    assert not ok
+    assert "unsatisfied parent dependencies" in err
