@@ -1107,6 +1107,11 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Pipeline columns (prime-pipeline §3.1). NULL role = legacy behaviour.
+    role: Optional[str] = None
+    plan_id: Optional[str] = None
+    forgejo_issue: Optional[str] = None
+    forgejo_kind: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1217,6 +1222,20 @@ class Task:
             ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
+            ),
+            role=(row["role"] if "role" in keys and row["role"] else None),
+            plan_id=(
+                row["plan_id"] if "plan_id" in keys and row["plan_id"] else None
+            ),
+            forgejo_issue=(
+                row["forgejo_issue"]
+                if "forgejo_issue" in keys and row["forgejo_issue"]
+                else None
+            ),
+            forgejo_kind=(
+                row["forgejo_kind"]
+                if "forgejo_kind" in keys and row["forgejo_kind"]
+                else None
             ),
             goal_mode=(
                 bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
@@ -10895,6 +10914,11 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # Pipeline role (prime-pipeline Task 5): route the worker's run through
+    # the role-specific shim path (architect = no worktree, etc.). NULL
+    # role = legacy behaviour, env var left unset.
+    if getattr(task, "role", None):
+        env["KANBAN_TASK_ROLE"] = task.role
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
