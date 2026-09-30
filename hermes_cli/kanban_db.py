@@ -1428,6 +1428,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
+    -- Edge kind: 'dep' = blocking dependency (gates claim/complete),
+    -- 'container' = work-breakdown membership (plan parents; never gates).
+    kind       TEXT NOT NULL DEFAULT 'dep',
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -2721,6 +2724,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "jev_payload" not in rcols:
         _add_column_if_missing(conn, "task_runs", "jev_payload", "jev_payload TEXT")
 
+    # Link-kind column (prime-pipeline Task 2b): container links (plan
+    # parents) must not gate their children. Legacy rows default to 'dep',
+    # which preserves the pre-kind gating behaviour exactly.
+    lcols = {row["name"] for row in conn.execute("PRAGMA table_info(task_links)")}
+    if "kind" not in lcols:
+        _add_column_if_missing(
+            conn, "task_links", "kind", "kind TEXT NOT NULL DEFAULT 'dep'"
+        )
+
     # Plans table (pipeline spec bodies). Defensive here so legacy DBs get
     # it even if SCHEMA_SQL creation was skipped for any reason.
     conn.execute(
@@ -3886,7 +3898,27 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    kind: str = "dep",
+) -> None:
+    """Create a parent->child edge.
+
+    ``kind``:
+
+    * ``'dep'`` (default) — a blocking dependency. While the parent is
+      not done, the child cannot be claimed or completed, and linking
+      demotes a ``ready`` child back to ``todo``.
+    * ``'container'`` — work-breakdown membership (e.g. a decomposed
+      plan parent). Never gates: the child stays runnable while the
+      container parent waits, so decomposed plans cannot deadlock
+      (t_f9f6a376).
+    """
+    if kind not in ("dep", "container"):
+        raise ValueError(f"unknown link kind: {kind!r}")
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -3898,21 +3930,26 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
         conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, child_id),
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id, kind) "
+            "VALUES (?, ?, ?)",
+            (parent_id, child_id, kind),
         )
         # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
+        # Container links are membership, not dependency — they must not
+        # gate, so they never demote.
+        if kind == "dep":
+            parent_status = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+            ).fetchone()["status"]
+            if parent_status != "done":
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
         _append_event(
             conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            {"parent": parent_id, "child": child_id, "kind": kind},
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
 
@@ -4619,7 +4656,7 @@ def recompute_ready(
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? AND l.kind = 'dep'",
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
@@ -4664,11 +4701,17 @@ def recompute_ready(
 # ---------------------------------------------------------------------------
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
+    """Return whether every direct parent is terminal for dependency gating.
+
+    Only ``kind = 'dep'`` links gate. Container links (work-breakdown
+    membership, e.g. decomposed plan parents) never block claim or
+    completion — they complete *because of* their children, so gating
+    on them would deadlock (t_f9f6a376).
+    """
     return conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
+        "WHERE l.child_id = ? AND l.kind = 'dep' "
         "AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone() is None
@@ -4701,7 +4744,8 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND l.kind = 'dep' "
+            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -6940,7 +6984,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     undone_parents = conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
+        "WHERE l.child_id = ? AND l.kind = 'dep' "
         "AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone()
