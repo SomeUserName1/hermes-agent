@@ -482,6 +482,16 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _branch_checked_out_in_worktree(repo_root: Path, branch_name: str) -> bool:
+    """Whether some linked worktree of *repo_root* currently checks out *branch_name*."""
+    result = _git(repo_root, "worktree", "list", "--porcelain", timeout=30)
+    want = f"branch refs/heads/{branch_name}"
+    for line in (result.stdout or "").splitlines():
+        if line.strip() == want:
+            return True
+    return False
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -496,16 +506,66 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
+        # A zombie run's worktree still holds the branch checkout; git refuses
+        # with "'<branch>' is already used by worktree ...". Run N+1 must not
+        # be blocked by run N's leftover, so retry with --force. A
+        # target-path-exists error is NOT forced past: the path holds data a
+        # --force add would clobber.
+        if (
+            "already exists" not in stderr
+            and _branch_checked_out_in_worktree(repo_root, branch_name)
+        ):
+            forced = _git(repo_root, *args, "--force", timeout=60)
+            if forced.returncode == 0:
+                return
+            stderr = (forced.stderr or forced.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+def _anchored_worktree(
+    repo_root: Path, task_id: str, branch_name: str, run_id: Optional[int] = None
+) -> tuple[Path, str]:
+    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree.
 
-
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
-    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
+    With ``run_id`` the tree is per-run: ``<repo>/.worktrees/<task-id>/<run-id>``
+    so consecutive runs of one task never share a checkout.
+    """
     target = repo_root / ".worktrees" / task_id
+    if run_id is not None:
+        target = target / str(run_id)
     _ensure_git_worktree(repo_root, target, branch_name)
     return target, branch_name
+
+
+def _main_repo_root(path: Path) -> Optional[Path]:
+    """Main-checkout root of the repo containing ``path``, linked-worktree safe.
+
+    ``_git_toplevel`` of a LINKED worktree returns the worktree itself, not the
+    main repo — useless for anchoring a new worktree (it would nest under the
+    old run's tree). ``--git-common-dir`` is ``<main>/.git`` for both the main
+    checkout and every linked worktree, so its parent is the main root.
+    """
+    common = _git_common_dir(path)
+    if common is not None and common.name == ".git":
+        return common.parent
+    return _git_toplevel(path)
+
+
+def _worktree_anchor_root(path: Path) -> Optional[Path]:
+    """Repo root to anchor a worktree target on, walking up if needed.
+
+    Unlike ``_repo_root_for_worktree_target`` this never anchors on a linked
+    worktree: intermediate ``.worktrees/<task>/<run>`` levels resolve to the
+    same main repo they hang off.
+    """
+    current = _nearest_existing_path(path).resolve(strict=False)
+    while True:
+        root = _main_repo_root(current)
+        if root is not None:
+            return root
+        if current == current.parent:
+            return None
+        current = current.parent
 
 
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
@@ -513,8 +573,16 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
-    launched from); with no anchor configured we fail loudly rather than guess."""
+    launched from); with no anchor configured we fail loudly rather than guess.
+
+    With ``task.current_run_id`` set (claimed task) the tree is per-run —
+    ``<repo>/.worktrees/<task-id>/<run-id>`` — and a persisted
+    ``workspace_path`` from a PREVIOUS run is never reused: the target is
+    re-derived from ``current_run_id`` on the same main repo. When
+    ``current_run_id`` is None the legacy task-level layout is kept.
+    """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    run_id = task.current_run_id
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
@@ -531,13 +599,21 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"board {board_slug!r} default_workdir {board_default!r} is not "
                 "absolute; use an absolute path to a git repo"
             )
-        repo_root = _git_toplevel(anchor)
+        if run_id is None:
+            repo_root = _git_toplevel(anchor)
+            if repo_root is None:
+                raise ValueError(
+                    f"task {task.id} has workspace_kind=worktree but board "
+                    f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
+                )
+            return _anchored_worktree(repo_root, task.id, branch_name)
+        repo_root = _worktree_anchor_root(anchor)
         if repo_root is None:
             raise ValueError(
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(repo_root, task.id, branch_name, run_id=run_id)
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -547,37 +623,59 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         )
     requested_resolved = requested.resolve(strict=False)
 
-    if requested.exists() and _is_linked_worktree_checkout(requested):
-        actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
-            return requested_resolved, actual_branch
-        # The requested path is an existing checkout of a DIFFERENT task's
-        # branch (decompose children inherit the root's workspace_path
-        # verbatim, so siblings all point here). Reusing it would run this task
-        # on the other task's branch — silent cross-task provenance corruption,
-        # unsafe under concurrency — so fall back to our own worktree.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
-        if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
-            if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this task's
-        # own canonical worktree): keep the legacy reuse rather than fail dispatch.
-        return requested_resolved, actual_branch or branch_name
+    if run_id is None:
+        if requested.exists() and _is_linked_worktree_checkout(requested):
+            actual_branch = _git_current_branch(requested)
+            if actual_branch == branch_name:
+                return requested_resolved, actual_branch
+            # The requested path is an existing checkout of a DIFFERENT task's
+            # branch (decompose children inherit the root's workspace_path
+            # verbatim, so siblings all point here). Reusing it would run this task
+            # on the other task's branch — silent cross-task provenance corruption,
+            # unsafe under concurrency — so fall back to our own worktree.
+            fallback_root = _repo_root_for_worktree_target(requested.parent)
+            if fallback_root is not None:
+                fallback = fallback_root / ".worktrees" / task.id
+                if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
+                    _ensure_git_worktree(fallback_root, fallback, branch_name)
+                    return fallback.resolve(strict=False), branch_name
+            # No repo to anchor a fallback on (or the occupied path IS this task's
+            # own canonical worktree): keep the legacy reuse rather than fail dispatch.
+            return requested_resolved, actual_branch or branch_name
 
-    repo_root = _git_toplevel(requested)
-    if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        repo_root = _git_toplevel(requested)
+        if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
+            return _anchored_worktree(repo_root, task.id, branch_name)
 
-    repo_root = _repo_root_for_worktree_target(requested.parent)
+        repo_root = _repo_root_for_worktree_target(requested.parent)
+        if repo_root is None:
+            raise ValueError(
+                f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
+                "and does not point at a git repo root"
+            )
+        _ensure_git_worktree(repo_root, requested, branch_name)
+        return requested, branch_name
+
+    # Per-run resolution: a persisted workspace_path from a PREVIOUS run must
+    # never be reused for this run — re-anchor on the same main repo and
+    # derive the target from current_run_id.
+    repo_root = _worktree_anchor_root(requested)
     if repo_root is None:
         raise ValueError(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
-    return requested, branch_name
+    target = repo_root / ".worktrees" / task.id / str(run_id)
+    if (
+        _path_key(requested_resolved) == _path_key(target)
+        and requested.exists()
+        and _is_linked_worktree_checkout(requested)
+        and _git_current_branch(requested) == branch_name
+    ):
+        # Same-run re-resolution: already materialized on the right branch.
+        return requested_resolved, branch_name
+    _ensure_git_worktree(repo_root, target, branch_name)
+    return target.resolve(strict=False), branch_name
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
