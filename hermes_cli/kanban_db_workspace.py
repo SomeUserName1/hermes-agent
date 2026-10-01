@@ -298,9 +298,86 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
+        # Sweep orphaned per-run sibling trees (<repo-root>/.worktrees/
+        # <task-id>/<run-id>, e.g. the tree of a failed/timed-out earlier run)
+        # BEFORE the branch delete: a zombie run tree still holds the
+        # wt/<task-id> checkout and would make ``git branch -D`` refuse it.
+        _gc_nested_run_worktrees(
+            repo_root, task_id, wp, _worktree_is_dirty, _worktree_has_unpushed_commits,
+        )
         branch = (branch_name or "").strip() or f"wt/{task_id}"
         if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
+    except Exception:
+        pass  # best-effort — never block completion
+
+
+def _gc_nested_run_worktrees(
+    repo_root: Path,
+    task_id: str,
+    primary_path: Path,
+    is_dirty,
+    has_unpushed,
+) -> None:
+    """Sweep orphaned per-run worktrees under ``<repo-root>/.worktrees/<task-id>``.
+
+    The per-run layout (``.worktrees/<task-id>/<run-id>``) means a failed or
+    timed-out run leaves its tree behind while the next run materializes a
+    fresh one; once the primary ``workspace_path`` tree is removed these
+    siblings would otherwise leak forever. Every candidate goes through the
+    same safety predicates as the primary tree (linked worktree of THIS repo,
+    not the main checkout, clean tree, every commit reachable from a
+    remote-tracking ref) and is removed WITHOUT ``--force``; any doubt
+    preserves it. The task dir itself is removed only when empty, so a
+    preserved zombie sibling tree keeps it alive. Best-effort."""
+    try:
+        task_dir = repo_root / ".worktrees" / task_id
+        if not task_dir.is_dir():
+            return  # legacy task-level layout: the worktree WAS the task dir
+        primary_key = _path_key(primary_path.resolve(strict=False))
+        root_key = _path_key(repo_root.resolve(strict=False))
+        for child in sorted(task_dir.iterdir()):
+            if child.is_symlink() or not child.is_dir():
+                continue  # a stray file/link keeps the task dir alive
+            child_key = _path_key(child.resolve(strict=False))
+            if child_key == primary_key:
+                continue  # the primary tree, handled by the caller
+            common = _git_common_dir(child)
+            if common is None or common.name != ".git":
+                continue  # not a linked worktree of a normal repo — never guess
+            child_repo_root = common.parent
+            if _path_key(child_repo_root.resolve(strict=False)) != root_key:
+                continue  # a worktree of a different repo — never guess
+            if child_key == _path_key(child_repo_root.resolve(strict=False)):
+                continue  # never remove a main checkout
+            if is_dirty(str(child)) or has_unpushed(str(child)):
+                _kb._log.info(
+                    "Preserving orphaned run worktree for task %s: "
+                    "dirty or unpushed work at %s",
+                    task_id, child,
+                )
+                continue
+            # No --force: git's own dirty guard re-verifies at removal time, so
+            # if the tree became dirty since our check (TOCTOU) removal fails
+            # safe — same contract as the primary tree.
+            release_lsp_clients(str(child.resolve(strict=False)))
+            result = _git(repo_root, "worktree", "remove", str(child), timeout=60)
+            if result.returncode != 0:
+                # Same single safe retry as the primary tree (Windows can
+                # retain a directory handle briefly).
+                time.sleep(0.1)
+                result = _git(repo_root, "worktree", "remove", str(child), timeout=60)
+            if result.returncode != 0:
+                _kb._log.warning(
+                    "git worktree remove failed for task %s run tree at %s: %s",
+                    task_id, child, (result.stderr or result.stdout or "").strip(),
+                )
+                continue
+            _kb._log.debug("Removed orphaned run worktree: %s", child)
+        try:
+            os.rmdir(task_dir)  # empty-only: a zombie sibling keeps it alive
+        except OSError:
+            pass
     except Exception:
         pass  # best-effort — never block completion
 
