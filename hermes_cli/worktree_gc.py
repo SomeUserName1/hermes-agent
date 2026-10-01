@@ -187,6 +187,11 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
 
     now = time.time()
     records: List[TreeRecord] = []
+    # Audit items: (display_name, path, age_days, size_mb, forced_keep_reason).
+    # Nested per-run kanban layout (<task>/<run-id>) descends into the task
+    # dir and lists every run tree individually; the task dir itself keeps
+    # its "kanban task tree" keep verdict (owned by kanban gc).
+    items: list = []
     for entry in sorted(worktrees_dir.iterdir()):
         if not entry.is_dir():
             continue
@@ -194,7 +199,42 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
             age_days = (now - entry.stat().st_mtime) / 86400.0
         except Exception:
             continue
+
+        if _KANBAN_RE.match(entry.name):
+            keep_reason = "kanban task tree (owned by kanban gc)"
+            if (entry / ".git").exists():
+                # Legacy flat layout (pre nested-runs): the task entry IS
+                # the worktree — keep today's skip behavior.
+                items.append((entry.name, entry, age_days, None, keep_reason))
+                continue
+            # Nested per-run layout: classify each run tree like any other
+            # tree so the attended prune can list and reclaim them.
+            for run_dir in sorted(entry.iterdir()):
+                if not run_dir.is_dir():
+                    continue
+                try:
+                    run_age = (now - run_dir.stat().st_mtime) / 86400.0
+                except Exception:
+                    continue
+                run_size = _tree_size_mb(run_dir) if with_sizes else None
+                items.append((
+                    f"{entry.name}/{run_dir.name}", run_dir,
+                    run_age, run_size, None,
+                ))
+            items.append((entry.name, entry, age_days, None, keep_reason))
+            continue
+
         size_mb = _tree_size_mb(entry) if with_sizes else None
+        items.append((entry.name, entry, age_days, size_mb, None))
+
+    for entry_name, entry, age_days, size_mb, forced_keep in items:
+        if forced_keep is not None:
+            records.append(TreeRecord(
+                name=entry_name, path=str(entry), branch="",
+                age_days=age_days, size_mb=size_mb,
+                verdict="keep", reason=forced_keep,
+            ))
+            continue
 
         try:
             branch_result = _git(["branch", "--show-current"], cwd=str(entry), timeout=5)
@@ -204,15 +244,11 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
 
         def rec(verdict: str, reason: str, untracked: Optional[List[str]] = None):
             records.append(TreeRecord(
-                name=entry.name, path=str(entry), branch=branch,
+                name=entry_name, path=str(entry), branch=branch,
                 age_days=age_days, size_mb=size_mb,
                 verdict=verdict, reason=reason,
                 untracked=untracked or [],
             ))
-
-        if _KANBAN_RE.match(entry.name):
-            rec("keep", "kanban task tree (owned by kanban gc)")
-            continue
 
         lock_state = _cli._worktree_lock_is_live(repo_root, str(entry), timeout=5)
         if lock_state == "live":
@@ -443,7 +479,16 @@ def worktrees_summary(repo_root: str) -> tuple[int, Optional[int]]:
     if not worktrees_dir.exists():
         return 0, None
     try:
-        count = sum(1 for e in worktrees_dir.iterdir() if e.is_dir())
+        count = 0
+        for e in worktrees_dir.iterdir():
+            if not e.is_dir():
+                continue
+            if _KANBAN_RE.match(e.name) and not (e / ".git").exists():
+                # Nested per-run layout: count each run tree, not the task
+                # dir itself (legacy flat t_<hex> worktrees count as one).
+                count += sum(1 for r in e.iterdir() if r.is_dir())
+            else:
+                count += 1
     except Exception:
         return 0, None
     size_mb: Optional[int] = None

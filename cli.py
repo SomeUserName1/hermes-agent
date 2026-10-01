@@ -2713,6 +2713,11 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     - ``hermes-*``: skip under 24h; reap 24h+ when clean and merged/pushed;
       72h+ is the aggressive tier (still never deletes real work).
     - named trees: same logic at 3x the timeline (72h soft / 9d hard).
+    - kanban run trees (``t_<hex>/<run-id>``, nested per-run layout): like
+      scratch trees (24h soft / 72h hard) with the same safety predicates —
+      orphaned runs from crashed dispatchers age-reap instead of leaking.
+      The task dir itself is only rmdir'd once it holds no run trees; legacy
+      flat ``t_<hex>`` worktrees (pre nested-runs) keep their skip behavior.
 
     Work-preservation guards (all tiers, any age):
     - uncommitted changes (dirty) — never removed;
@@ -2792,8 +2797,38 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     # Cheap stat-only pass so the thread pool below is sized to the trees that
     # actually need git work, not to everything on disk.
     candidates: list = []
+    # Nested per-run layout: <repo>/.worktrees/<task-id>/<run-id>. Task dirs
+    # we descended into are rmdir'd after the sweep once they hold no trees.
+    descended_task_dirs: list = []
     for entry in sorted(worktrees_dir.iterdir()):
-        if not entry.is_dir() or kanban_re.match(entry.name):
+        if not entry.is_dir():
+            continue
+
+        if kanban_re.match(entry.name):
+            if (entry / ".git").exists():
+                # Legacy flat layout (pre nested-runs): the task entry IS the
+                # worktree, owned by the kanban dispatcher's gc — skip it.
+                continue
+            # Nested per-run layout: iterate the CHILD directories as run
+            # trees. Each run tree is classified like a scratch tree (24h
+            # soft / 72h hard) with the same safety predicates below, so
+            # orphaned run trees age-reap instead of leaking forever. The
+            # task dir itself is only removed (rmdir-only) once empty.
+            descended_task_dirs.append(entry)
+            run_soft_cutoff = now - (max_age_hours * 3600)
+            run_hard_cutoff = now - (max_age_hours * 3 * 3600)
+            for run_dir in sorted(entry.iterdir()):
+                if not run_dir.is_dir():
+                    continue
+                try:
+                    mtime = run_dir.stat().st_mtime
+                    if mtime > run_soft_cutoff:
+                        continue  # Too recent — skip
+                except Exception:
+                    continue
+                candidates.append(
+                    (run_dir, mtime, mtime <= run_hard_cutoff)
+                )
             continue
 
         # Scratch trees (hermes-*) age out on the default schedule; named
@@ -2812,7 +2847,20 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
 
         candidates.append((entry, mtime, mtime <= hard_cutoff))
 
+    def _rmdir_emptied_task_dirs() -> None:
+        # A task dir is removed only once it holds no run trees anymore
+        # (rmdir-only: a non-empty dir always fails harmlessly). Covers dirs
+        # emptied by this sweep and ones created but never populated.
+        for task_dir in descended_task_dirs:
+            try:
+                task_dir.rmdir()
+            except OSError:
+                pass
+            else:
+                logger.debug("Removed empty kanban task dir: %s", task_dir)
+
     if not candidates:
+        _rmdir_emptied_task_dirs()
         _prune_orphaned_branches(repo_root)
         return
 
@@ -2917,13 +2965,14 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     # the orphaned-branch pass even though their worktree is now gone.
     kept_branches: set = set()
     for entry, mtime, force, verdict, lock_state in verdicts:
+        display = entry.relative_to(worktrees_dir).as_posix()
         if verdict == "dirty":
             if mtime <= stale_work_cutoff:
-                preserved_stale.append(f"{entry.name} (uncommitted changes)")
+                preserved_stale.append(f"{display} (uncommitted changes)")
             continue
         if verdict == "unpushed":
             if mtime <= stale_work_cutoff:
-                preserved_stale.append(f"{entry.name} (unpushed commits)")
+                preserved_stale.append(f"{display} (unpushed commits)")
             continue
         if verdict == "locked-live":
             logger.debug("Skipping live-locked worktree: %s", entry.name)
@@ -2981,6 +3030,7 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
             len(preserved_stale), ", ".join(sorted(preserved_stale)),
         )
 
+    _rmdir_emptied_task_dirs()
     _prune_orphaned_branches(repo_root, protect=kept_branches)
 
     # Escalation notice: the startup pass is deliberately conservative, so
