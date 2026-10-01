@@ -180,8 +180,252 @@ def _dispatch_display(dispatch: dict) -> Optional[str]:
     )
 
 
-def cron_list(show_all: bool = False):
-    """List all scheduled jobs."""
+def _cron_homes() -> List[tuple]:
+    """Return (profile_name, home_path) for every Hermes home with a store.
+
+    Anchored via ``hermes_cli.profiles.list_profiles`` (default home + named
+    profiles) so the list matches what ``hermes profile list`` shows. Symlink
+    duplicates (a profile path pointing at another home) collapse to the
+    first occurrence.
+    """
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        infos = list_profiles()
+    except Exception:
+        infos = []
+    homes: List[tuple] = []
+    seen = set()
+    for info in infos:
+        path = Path(getattr(info, "path", info))
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        homes.append((getattr(info, "name", str(path)), path))
+    return homes
+
+
+def _load_jobs_readonly(jobs_file: Path) -> Optional[List[Dict[str, Any]]]:
+    """Read a cron store's jobs without load/repair/merge side effects.
+
+    Returns ``None`` when the store exists but is unreadable, so callers can
+    surface that instead of silently treating a broken store as empty.
+    """
+    try:
+        raw = jobs_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+    elif isinstance(data, list):
+        jobs = data
+    else:
+        return None
+    if isinstance(jobs, dict):
+        # id-keyed map written by external tools — flatten (see load_jobs).
+        jobs = [v for v in jobs.values() if isinstance(v, dict)]
+    if not isinstance(jobs, list):
+        return None
+    return [j for j in jobs if isinstance(j, dict)]
+
+
+def _print_cron_job(job: Dict[str, Any]) -> None:
+    """Render a single scheduled job entry."""
+    from cron.jobs import effective_job_state
+
+    job_id = job.get("id", "?")
+    name = job.get("name", "(unnamed)")
+    schedule = job.get("schedule_display", job.get("schedule", {}).get("value", "?"))
+    # Derive from the scheduler-honoured flag — never show [paused] when
+    # enabled=true (half-paused contradiction must not look frozen).
+    state = effective_job_state(job)
+    next_run = job.get("next_run_at", "?")
+
+    # `repeat` may be present-but-null in the job record (e.g. a one-shot
+    # job persisted with "repeat": null), so coalesce to {} rather than
+    # relying on the dict-default, which only applies to a missing key.
+    repeat_info = job.get("repeat") or {}
+    repeat_times = repeat_info.get("times")
+    repeat_completed = repeat_info.get("completed", 0)
+    repeat_str = f"{repeat_completed}/{repeat_times}" if repeat_times else "∞"
+
+    # `deliver` may be present-but-null in the job record (same pitfall as
+    # `repeat` above), so coalesce to the default rather than relying on the
+    # dict-default, which only applies to a missing key. A null value would
+    # otherwise reach `", ".join(None)` and crash the whole listing (#32896).
+    deliver = job.get("deliver") or ["local"]
+    if isinstance(deliver, str):
+        deliver = [deliver]
+    deliver_str = ", ".join(deliver)
+
+    skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
+    if state == "paused":
+        status = color("[paused]", Colors.YELLOW)
+    elif state == "completed":
+        status = color("[completed]", Colors.BLUE)
+    elif job.get("enabled", True):
+        status = color("[active]", Colors.GREEN)
+    else:
+        status = color("[disabled]", Colors.RED)
+
+    print(f"  {color(job_id, Colors.YELLOW)} {status}")
+    print(f"    Name:      {name}")
+    print(f"    Schedule:  {schedule}")
+    print(f"    Repeat:    {repeat_str}")
+    print(f"    Next run:  {next_run}")
+    print(f"    Deliver:   {deliver_str}")
+    if skills:
+        print(f"    Skills:    {', '.join(skills)}")
+    script = job.get("script")
+    if script:
+        print(f"    Script:    {script}")
+    monitor_source = job.get("monitor_script") or job.get("monitor_url")
+    if monitor_source:
+        print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
+        mon_state = job.get("monitor_state") or {}
+        if mon_state.get("last_changed_at"):
+            print(f"    Changed:   {mon_state['last_changed_at']}")
+    if job.get("no_agent"):
+        print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
+    workdir = job.get("workdir")
+    if workdir:
+        print(f"    Workdir:   {workdir}")
+
+    # Execution history
+    last_status = job.get("last_status")
+    if last_status:
+        last_run = job.get("last_run_at", "?")
+        if last_status == "ok":
+            status_display = color("ok", Colors.GREEN)
+        else:
+            status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
+            streak = int(job.get("failure_streak") or 0)
+            if streak >= 2:
+                status_display += color(f"  ({streak} failures in a row)", Colors.RED)
+        print(f"    Last run:  {last_run}  {status_display}")
+
+    dispatch_line = _dispatch_display(job.get("last_dispatch"))
+    if dispatch_line:
+        print(f"    Dispatch:  {dispatch_line}")
+
+    latest_execution = job.get("latest_execution")
+    if latest_execution:
+        print(
+            f"    Execution: {latest_execution.get('status', '?')}  "
+            f"{latest_execution.get('id', '?')}"
+        )
+
+    delivery_err = job.get("last_delivery_error")
+    if delivery_err:
+        print(f"    {color('⚠ Delivery failed:', Colors.YELLOW)} {delivery_err}")
+
+    fire_err = job.get("last_fire_error")
+    if isinstance(fire_err, dict) and fire_err.get("detail"):
+        print(
+            f"    {color('⚠ Missed scheduled fire:', Colors.RED)} "
+            f"{fire_err.get('at', '?')}  {fire_err['detail']}"
+        )
+
+    print()
+
+
+def _other_homes_with_jobs(show_all: bool) -> List[tuple]:
+    """Return (profile_name, enabled-job-count) for stores other than the
+    active HERMES_HOME's."""
+    from hermes_constants import get_hermes_home
+
+    current = Path(get_hermes_home()).resolve()
+    others: List[tuple] = []
+    for name, home in _cron_homes():
+        try:
+            if home.resolve() == current:
+                continue
+        except OSError:
+            pass
+        jobs = _load_jobs_readonly(home / "cron" / "jobs.json")
+        if not jobs:
+            continue
+        if not show_all:
+            jobs = [j for j in jobs if j.get("enabled", True)]
+        if jobs:
+            others.append((name, len(jobs)))
+    return others
+
+
+def _print_cross_home_hint(show_all: bool) -> None:
+    """Point at jobs registered in other profiles' cron stores (t_b517f592).
+
+    ``hermes cron list`` reads only the active HERMES_HOME's store. Jobs
+    created via a platform chat (deliver=origin/discord/...) are typically
+    registered in the default home, so an agent running under a named
+    profile would wrongly conclude such jobs are missing.
+    """
+    others = _other_homes_with_jobs(show_all)
+    if not others:
+        return
+    summary = ", ".join(f"{name}: {count}" for name, count in others)
+    print(color(
+        "Note: this list shows only the active profile's cron store. "
+        f"More job(s) registered in other profiles — {summary}. "
+        "Use 'hermes cron list --all-homes' to list every profile's jobs.",
+        Colors.DIM,
+    ))
+
+
+def _cron_list_all_homes(show_all: bool) -> None:
+    """List jobs from every profile's cron store (t_b517f592)."""
+    homes = _cron_homes()
+    if not homes:
+        from hermes_constants import get_hermes_home
+
+        homes = [("active", Path(get_hermes_home()))]
+
+    total = 0
+    unreadable = False
+    for name, home in homes:
+        jobs = _load_jobs_readonly(home / "cron" / "jobs.json")
+        print()
+        print(color(f"━━ {name} ━━ {home}", Colors.CYAN))
+        if jobs is None:
+            print(color("  (cron store unreadable — skipped)", Colors.YELLOW))
+            unreadable = True
+            continue
+        if not show_all:
+            jobs = [j for j in jobs if j.get("enabled", True)]
+        if not jobs:
+            print(color("  (no scheduled jobs)", Colors.DIM))
+            continue
+        total += len(jobs)
+        for job in jobs:
+            _print_cron_job(job)
+
+    if total == 0:
+        print()
+        if unreadable:
+            print(color("No readable scheduled jobs in any profile store.", Colors.DIM))
+        else:
+            print(color("No scheduled jobs.", Colors.DIM))
+            print(color("Create one with 'hermes cron create ...' or the /cron command in chat.", Colors.DIM))
+
+    _warn_if_gateway_not_running()
+
+
+def cron_list(show_all: bool = False, all_homes: bool = False):
+    """List scheduled jobs (optionally across every profile's cron store)."""
+    if all_homes:
+        _cron_list_all_homes(show_all)
+        return
+
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
@@ -189,6 +433,7 @@ def cron_list(show_all: bool = False):
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
         print(color("Create one with 'hermes cron create ...' or the /cron command in chat.", Colors.DIM))
+        _print_cross_home_hint(show_all)
         return
 
     print()
@@ -197,107 +442,11 @@ def cron_list(show_all: bool = False):
     print(color("└─────────────────────────────────────────────────────────────────────────┘", Colors.CYAN))
     print()
 
-    from cron.jobs import effective_job_state
-
     for job in jobs:
-        job_id = job.get("id", "?")
-        name = job.get("name", "(unnamed)")
-        schedule = job.get("schedule_display", job.get("schedule", {}).get("value", "?"))
-        # Derive from the scheduler-honoured flag — never show [paused] when
-        # enabled=true (half-paused contradiction must not look frozen).
-        state = effective_job_state(job)
-        next_run = job.get("next_run_at", "?")
-
-        # `repeat` may be present-but-null in the job record (e.g. a one-shot
-        # job persisted with "repeat": null), so coalesce to {} rather than
-        # relying on the dict-default, which only applies to a missing key.
-        repeat_info = job.get("repeat") or {}
-        repeat_times = repeat_info.get("times")
-        repeat_completed = repeat_info.get("completed", 0)
-        repeat_str = f"{repeat_completed}/{repeat_times}" if repeat_times else "∞"
-
-        # `deliver` may be present-but-null in the job record (same pitfall as
-        # `repeat` above), so coalesce to the default rather than relying on the
-        # dict-default, which only applies to a missing key. A null value would
-        # otherwise reach `", ".join(None)` and crash the whole listing (#32896).
-        deliver = job.get("deliver") or ["local"]
-        if isinstance(deliver, str):
-            deliver = [deliver]
-        deliver_str = ", ".join(deliver)
-
-        skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
-        if state == "paused":
-            status = color("[paused]", Colors.YELLOW)
-        elif state == "completed":
-            status = color("[completed]", Colors.BLUE)
-        elif job.get("enabled", True):
-            status = color("[active]", Colors.GREEN)
-        else:
-            status = color("[disabled]", Colors.RED)
-
-        print(f"  {color(job_id, Colors.YELLOW)} {status}")
-        print(f"    Name:      {name}")
-        print(f"    Schedule:  {schedule}")
-        print(f"    Repeat:    {repeat_str}")
-        print(f"    Next run:  {next_run}")
-        print(f"    Deliver:   {deliver_str}")
-        if skills:
-            print(f"    Skills:    {', '.join(skills)}")
-        script = job.get("script")
-        if script:
-            print(f"    Script:    {script}")
-        monitor_source = job.get("monitor_script") or job.get("monitor_url")
-        if monitor_source:
-            print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
-            mon_state = job.get("monitor_state") or {}
-            if mon_state.get("last_changed_at"):
-                print(f"    Changed:   {mon_state['last_changed_at']}")
-        if job.get("no_agent"):
-            print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
-        workdir = job.get("workdir")
-        if workdir:
-            print(f"    Workdir:   {workdir}")
-
-        # Execution history
-        last_status = job.get("last_status")
-        if last_status:
-            last_run = job.get("last_run_at", "?")
-            if last_status == "ok":
-                status_display = color("ok", Colors.GREEN)
-            else:
-                status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
-                streak = int(job.get("failure_streak") or 0)
-                if streak >= 2:
-                    status_display += color(f"  ({streak} failures in a row)", Colors.RED)
-            print(f"    Last run:  {last_run}  {status_display}")
-
-        dispatch_line = _dispatch_display(job.get("last_dispatch"))
-        if dispatch_line:
-            print(f"    Dispatch:  {dispatch_line}")
-
-        latest_execution = job.get("latest_execution")
-        if latest_execution:
-            print(
-                f"    Execution: {latest_execution.get('status', '?')}  "
-                f"{latest_execution.get('id', '?')}"
-            )
-
-        delivery_err = job.get("last_delivery_error")
-        if delivery_err:
-            print(f"    {color('⚠ Delivery failed:', Colors.YELLOW)} {delivery_err}")
-
-        fire_err = job.get("last_fire_error")
-        if isinstance(fire_err, dict) and fire_err.get("detail"):
-            print(
-                f"    {color('⚠ Missed scheduled fire:', Colors.RED)} "
-                f"{fire_err.get('at', '?')}  {fire_err['detail']}"
-            )
-
-        print()
+        _print_cron_job(job)
 
     _warn_if_gateway_not_running()
-
-
+    _print_cross_home_hint(show_all)
 def cron_tick():
     """Run due jobs once and exit."""
     from cron.scheduler import CronTickYielded, tick
@@ -1033,7 +1182,8 @@ def cron_command(args):
 
     if subcmd is None or subcmd == "list":
         show_all = getattr(args, 'all', False)
-        cron_list(show_all)
+        all_homes = getattr(args, 'all_homes', False)
+        cron_list(show_all, all_homes=all_homes)
         return 0
 
     if subcmd == "status":

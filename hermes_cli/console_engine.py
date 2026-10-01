@@ -591,7 +591,7 @@ class HermesConsoleEngine:
             mutating=True,
             confirmation="Update Hermes configuration?",
         )
-        self.register(("cron", "list"), "cron list [--all]", "List scheduled jobs.", _cron_list)
+        self.register(("cron", "list"), "cron list [--all] [--all-homes]", "List scheduled jobs.", _cron_list)
         self.register(("cron", "status"), "cron status", "Show cron scheduler status.", _cron_status)
         self.register(
             ("cron", "pause"),
@@ -1581,10 +1581,11 @@ def _profile_status(_engine: HermesConsoleEngine, args: list[str]) -> str:
 def _cron_list(_engine: HermesConsoleEngine, args: list[str]) -> str:
     parser = _ArgumentParser(prog="cron list", add_help=False)
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--all-homes", action="store_true", dest="all_homes")
     ns = parser.parse_args(args)
     from hermes_cli.cron import cron_list
 
-    return _capture_output(lambda: cron_list(show_all=ns.all))
+    return _capture_output(lambda: cron_list(show_all=ns.all, all_homes=ns.all_homes))
 
 
 def _cron_status(_engine: HermesConsoleEngine, args: list[str]) -> str:
