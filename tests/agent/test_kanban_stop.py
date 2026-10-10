@@ -160,3 +160,104 @@ def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
     # The nudge offers every worker exit, not just close-out; a card that must go
     # through review must never be steered to ``kanban_complete`` alone.
     assert "kanban_request_review" in nudge and "kanban_block" in nudge
+
+
+# ── Plugin extension of the terminal-tools set ────────────────────────
+# Plugins register board tools into the ``kanban`` toolset via
+# ``PluginContext.register_tool``; the stop-gate must accept them, but a broken
+# plugin stack must never break the guard (fail-open to the builtin set).
+
+
+@pytest.fixture
+def isolated_registry(monkeypatch):
+    """A pristine ``tools.registry`` registry so test results don't depend on
+    which built-in tools some earlier test registered into the global registry."""
+    import tools.registry as registry_mod
+
+    fresh = registry_mod.ToolRegistry()
+    monkeypatch.setattr(registry_mod, "registry", fresh)
+    return fresh
+
+
+def _tool_msg(name: str) -> list:
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": name, "tool_call_id": "1", "content": "ok"},
+    ]
+
+
+def test_effective_terminal_tools_default_is_builtin(isolated_registry):
+    """Without plugin additions the effective set is exactly the builtin set."""
+    from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS, _effective_terminal_tools
+
+    assert _effective_terminal_tools() == _TERMINAL_KANBAN_TOOLS
+
+
+def test_plugin_registered_kanban_tool_satisfies_stop_gate(
+    isolated_registry, clear_kanban_env
+):
+    """A plugin's board handoff tool (registered into the kanban toolset) ends the
+    worker's turn just like ``kanban_complete`` — no nudge after it."""
+    from tools.registry import registry
+
+    def handler(**kwargs):
+        return "handed off"
+
+    registry.register(
+        name="kanban_handoff_custom",
+        toolset="kanban",
+        schema={"type": "object", "properties": {}},
+        handler=handler,
+    )
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_plugin")
+
+    messages = _tool_msg("kanban_handoff_custom")
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+    # Widening must not swallow the case the guard exists for.
+    nudge = build_kanban_stop_nudge(messages=_tool_msg("kanban_comment"))
+    assert nudge is not None
+
+
+def test_plugin_lookup_failure_fails_open(isolated_registry, monkeypatch, clear_kanban_env):
+    """A plugin-stack failure while consulting the registry degrades to the builtin
+    set; the stop-gate keeps working."""
+    from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS, _effective_terminal_tools
+
+    def boom(toolset):
+        raise RuntimeError("plugin stack exploded")
+
+    monkeypatch.setattr(isolated_registry, "get_tool_names_for_toolset", boom)
+    assert _effective_terminal_tools() == _TERMINAL_KANBAN_TOOLS
+    assert "kanban_complete" in _effective_terminal_tools()
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_fail")
+    assert build_kanban_stop_nudge(messages=_tool_msg("kanban_comment")) is not None
+
+
+def test_registry_import_failure_fails_open(monkeypatch, clear_kanban_env):
+    """No tool-registry infra at all → builtin set, guard unaffected."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "tools.registry":
+            raise ImportError("no registry in this process")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS, _effective_terminal_tools
+
+    assert _effective_terminal_tools() == _TERMINAL_KANBAN_TOOLS
