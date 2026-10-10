@@ -1205,6 +1205,19 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             self._pending_resume_sessions = None
 
         entry = self._slash_handler(canonical)
+        # A plugin that explicitly registered this command name takes precedence over the
+        # built-in handler (e.g. a plugin shipping a richer /kanban than the builtin wrapper).
+        # Only names registered by a loaded plugin override; default behavior is unchanged
+        # when no plugin registers the name.
+        if entry is not None and canonical in _get_plugin_cmd_handler_names():
+            from hermes_cli.plugins import get_plugin_commands
+            owner = get_plugin_commands()[canonical].get("plugin", "?")
+            logger.info("Plugin command override: /%s dispatched to plugin %s (built-in handler %s bypassed)",
+                        canonical, owner, entry[0])
+            base_cmd = cmd_lower.split()[0]
+            self._run_plugin_slash_command(base_cmd, cmd_original[len(base_cmd):].strip())
+            return True
+
         if entry is None:
             return self._process_unregistered_slash(cmd_original, cmd_lower)
         method_name, pass_arg = entry
