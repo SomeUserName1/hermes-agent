@@ -2205,19 +2205,9 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    try:
-        from hermes_cli.lifecycle import invoke_hook
-        hook_results = invoke_hook(
-            "pre_kanban_task_claim",
-            conn=conn,
-            task_id=task_id,
-            claimer=lock,
-        )
-        for hr in hook_results:
-            if isinstance(hr, dict) and hr.get("allow") is False:
-                return None
-    except Exception as exc:
-        _log.debug("pre_kanban_task_claim hook error: %s", exc)
+    from hermes_cli.kanban_db_hooks import run_pre_kanban_task_claim
+    if not run_pre_kanban_task_claim(conn, task_id, lock):
+        return None
     with write_txn(conn):
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
@@ -2557,47 +2547,6 @@ def reassign_task(
         return False
 
 
-def _verify_created_cards(
-    conn: sqlite3.Connection, completing_task_id: str, claimed_ids: Iterable[str],
-) -> tuple[list[str], list[str]]:
-    """Partition ``claimed_ids`` into (verified, phantom). Verified = the row
-    exists AND ``created_by`` is the completing task's assignee or id, OR the
-    card is linked as its child (created elsewhere, attached by the worker).
-    Never mutates."""
-    ordered = list(dict.fromkeys(str(x).strip() for x in (claimed_ids or []) if str(x).strip()))
-    if not ordered:
-        return [], []
-
-    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,)).fetchone()
-    if row is None:
-        # Completing task not found — nothing resolves.
-        return [], ordered
-    completing_assignee = row["assignee"]
-
-    # Batch-fetch existence + created_by in one query.
-    placeholders = ",".join(["?"] * len(ordered))
-    rows = conn.execute(
-        f"SELECT id, created_by FROM tasks WHERE id IN ({placeholders})", tuple(ordered),
-    ).fetchall()
-    found = {r["id"]: r["created_by"] for r in rows}
-
-    # Pull the set of cards linked as children of the completing task.
-    # Cheap: one query, indexed on parent_id.
-    linked_children: set[str] = set(child_ids(conn, completing_task_id))
-
-    verified: list[str] = []
-    phantom: list[str] = []
-    for cid in ordered:
-        created_by = found.get(cid)
-        trusted = created_by is not None and (
-            (completing_assignee and created_by == completing_assignee)
-            or created_by == completing_task_id
-            or cid in linked_children
-        )
-        (verified if trusted else phantom).append(cid)
-    return verified, phantom
-
-
 # Matches ``kanban_create`` (12 hex) and ``_new_task_id`` (8 hex) ids; 8+ for forward compat.
 _TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
 
@@ -2696,37 +2645,19 @@ def complete_task(
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    from hermes_cli.kanban_db_completion import _gate_created_cards, _gate_empty_completion
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
 
-    # PR 2 contribution (#96797): the policy veto fires AFTER the mechanical gates
-    # (cards/empty-completion) so a hook sees a mechanically valid completion, and
-    # BEFORE the final txn so a rejection leaves durable state untouched.
+    from hermes_cli.kanban_db_hooks import run_pre_kanban_task_complete
+    # PR #96797: the policy veto fires AFTER the mechanical gates (cards/empty-completion)
+    # so a hook sees a mechanically valid completion, and BEFORE the final txn so a
+    # rejection leaves durable state untouched. Veto = auditable event + PermissionError.
     if fire_lifecycle_hook:
-        try:
-            from hermes_cli.lifecycle import invoke_hook
-            hook_results = invoke_hook(
-                "pre_kanban_task_complete",
-                conn=conn,
-                task_id=task_id,
-                result=result,
-                summary=summary,
-                metadata=metadata,
-                created_cards=created_cards,
-            )
-            for hr in hook_results:
-                if isinstance(hr, dict) and hr.get("allow") is False:
-                    reason = hr.get("reason", "completion rejected by pre_kanban_task_complete hook")
-                    with write_txn(conn):
-                        _append_event(
-                            conn, task_id, "completion_blocked_policy",
-                            {"reason": reason},
-                        )
-                    raise PermissionError(reason)
-        except PermissionError:
-            raise
-        except Exception as exc:
-            _log.debug("pre_kanban_task_complete hook error: %s", exc)
+        run_pre_kanban_task_complete(
+            conn, task_id, result=result, summary=summary, metadata=metadata,
+            created_cards=created_cards,
+        )
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2805,67 +2736,6 @@ def complete_task(
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
-
-
-def _gate_created_cards(
-    conn: sqlite3.Connection, task_id: str, created_cards: Optional[Iterable[str]], preview_text: Optional[str],
-) -> list[str]:
-    """Verify ``created_cards`` BEFORE the main write txn; returns the verified
-    ids. A phantom id is recorded in its own tiny txn (auditable) then raised
-    as :class:`HallucinatedCardsError` without touching task state."""
-    if not created_cards:
-        return []
-    verified_cards, phantom_cards = _verify_created_cards(conn, task_id, created_cards)
-    if phantom_cards:
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "completion_blocked_hallucination",
-                {
-                    "phantom_cards": phantom_cards,
-                    "verified_cards": verified_cards,
-                    "summary_preview": _first_line(preview_text, 200) or None,
-                },
-            )
-        raise HallucinatedCardsError(phantom_cards, task_id)
-    return verified_cards
-
-
-def _substantive_text(value: Optional[str]) -> bool:
-    return bool(value is not None and str(value).strip())
-
-
-def _gate_empty_completion(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    result: Optional[str],
-    summary: Optional[str],
-) -> None:
-    """Refuse a completion that would leave the card with no evidence.
-
-    Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
-    """
-    row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return
-    if row["status"] == "review":
-        return
-    stored = row["result"]
-    if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
-        return
-    with write_txn(conn):
-        _append_event(
-            conn, task_id, "completion_blocked_empty_result",
-            {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
-            },
-        )
-    raise EmptyCompletionError(task_id)
 
 
 def _stage_completion_artifacts(

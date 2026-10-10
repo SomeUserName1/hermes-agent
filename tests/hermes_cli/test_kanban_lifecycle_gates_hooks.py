@@ -6,15 +6,16 @@ import sqlite3
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import plugins
 
 
 def test_pre_kanban_task_complete_veto(tmp_path, monkeypatch):
     """Plugins can synchronously reject a task completion via pre_kanban_task_complete hook."""
     db_path = tmp_path / "kanban.db"
-    conn = kb.connect(db_path=db_path)
+    conn = kbc.connect(db_path=db_path)
 
-    task_id = kb.create_task(conn, title="Gated Task", body="Test body", created_by="test")
+    task_id = kb.create_task(conn, title="Gated Task", body="Test body")
     kb.claim_task(conn, task_id)
 
     # Register a hook that vetos completion
@@ -45,9 +46,9 @@ def test_pre_kanban_task_complete_veto(tmp_path, monkeypatch):
 def test_pre_kanban_task_claim_veto(tmp_path):
     """Plugins can veto task claim via pre_kanban_task_claim hook."""
     db_path = tmp_path / "kanban.db"
-    conn = kb.connect(db_path=db_path)
+    conn = kbc.connect(db_path=db_path)
 
-    task_id = kb.create_task(conn, title="Claim Gated Task", body="Test body", created_by="test")
+    task_id = kb.create_task(conn, title="Claim Gated Task", body="Test body")
 
     def _veto_claim(**kwargs):
         if kwargs.get("task_id") == task_id:
